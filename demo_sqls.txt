@@ -1,0 +1,179 @@
+// ###################################################################
+// ################# Setup Statements ################################
+// ###################################################################
+
+// Hive table for raw data in landing zone:
+CREATE TABLE json_feed_landing
+USING PARQUET
+LOCATION cos://us-south/my-data-lake-cos-bucket/landing_demo/topic=json_feed/jobid=9de5fd82-4940-4d88-9f5c-0fa9ac0dbe19
+
+// View with column name cleansing and type casting on data in landing zone:
+CREATE OR REPLACE VIEW json_feed_view AS
+       SELECT `device%20id` device_id, timestamp(message_timestamp) message_timestamp,
+              timestamp(metadata.`device_setup_time`) device_setup_time, metadata.timezone payload_tz, row_number payload_row,
+              metadata.location.longitude, metadata.location.latitude,
+              measurements.`pressure%20%7Bmbar%7D` pressure, measurements.temperature, measurements.humidity
+       FROM json_feed_landing
+
+// Partitioned hive table for compacted data mart zone
+CREATE TABLE streaming_mart (
+       device_id string,
+       message_date date,
+       message_hour int,
+       message_timestamp timestamp,
+       device_setup_time timestamp,
+       payload_tz string,
+       row_number int,
+       longitude double,
+       latitude double,
+       pressure double,
+       temperature double,
+       humidity double)
+USING PARQUET
+PARTITIONED BY (message_date, message_hour)
+LOCATION cos://us-south/my-data-lake-cos-bucket/landing_mart/
+
+// Adding all currently existing hive partitions in data mart zone
+ALTER TABLE streaming_mart RECOVER PARTITIONS
+
+// View that lists all objects in landing zone that can be deleted because their rows have been compacted already
+CREATE OR REPLACE VIEW deletable_landing_objects AS
+WITH compacted_hour_threshold AS (SELECT MAX(message_date || ' ' || lpad(message_hour+1, 2, '0') || ':00:00') threshold FROM streaming_mart)
+SELECT split(input_path, '/')[2] input_bucket,
+       split(input_path, '/')[length(input_path) - length(replace(input_path,'/'))] input_object,
+       substr(input_path, length(substring_index(input_path, '/', 3)) + 2) input_object_path
+FROM (SELECT distinct(input_file_name()) input_path FROM json_feed_view WHERE message_timestamp <  timestamp((select threshold from compacted_hour_threshold))
+      EXCEPT
+      SELECT distinct(input_file_name()) input_path FROM json_feed_view WHERE message_timestamp >= timestamp((select threshold from compacted_hour_threshold)))
+
+// View that lists the number of objects, hours and rows that are ready to be compacted from landing zone to data mart zone
+// Note: You may need to adapt the timezone to your own one!!
+CREATE OR REPLACE VIEW compactable_data AS
+WITH compacted_hour_threshold AS (SELECT MAX(message_date || ' ' || lpad(message_hour+1, 2, '0') || ':00:00') threshold FROM streaming_mart),
+last_full_hour_threshold AS (SELECT date_format(from_utc_timestamp(date_trunc('HOUR', CURRENT_TIMESTAMP), 'UTC'), 'yyyy-MM-dd HH:mm:ss') threshold)
+SELECT count(*) compactable_objects,
+       sum(rows_per_object) compactable_rows,
+	   GREATEST(0, (hour((select threshold from last_full_hour_threshold)) - hour((select threshold from compacted_hour_threshold)))
+	                + 24 * (datediff((select threshold from last_full_hour_threshold), (select threshold from compacted_hour_threshold)))) compactable_hours,
+      (select timestamp(threshold) from compacted_hour_threshold) compacted_hour_threshold,
+	  (select timestamp(threshold) from last_full_hour_threshold) last_full_hour_threshold
+FROM (SELECT count(*) rows_per_object FROM json_feed_view
+      WHERE message_timestamp >= timestamp((select threshold from compacted_hour_threshold)) AND
+            message_timestamp <  timestamp((select threshold from last_full_hour_threshold))
+      GROUP BY input_file_name())
+
+// ###################################################################
+// ### Compaction Statements (to be automated to run once per hour) ##
+// ###################################################################
+
+// Compaction ETL from landing zone to data mart zone for a given hour of data
+SELECT * FROM json_feed_view
+WHERE message_timestamp >= timestamp('2021-08-05 15:00:00') AND message_timestamp < timestamp('2021-08-05 16:00:00')
+INTO cos://us-south/my-data-lake-cos-bucket/landing_mart/message_date=2021-08-05/message_hour=15 JOBPREFIX NONE STORED AS PARQUET
+
+// Add new compacted hour partition to data mart
+ALTER TABLE streaming_mart ADD PARTITION (message_date ="2021-08-05", message_hour="15")
+LOCATION cos://us-south/my-data-lake-cos-bucket/landing_mart/message_date=2021-08-05/message_hour=15
+
+// Update view UNIIONing all data in compacted data mart with the not yet compacted data in landing zone
+CREATE OR REPLACE VIEW streaming_mart_realtime AS
+SELECT * FROM json_feed_view WHERE message_timestamp >= timestamp('2021-08-05 16:00:00')
+UNION ALL
+SELECT device_id, message_timestamp, device_setup_time, payload_tz, row_number,
+       longitude, latitude, pressure, temperature, humidity
+FROM streaming_mart
+
+// The following two SQLs are also available in combined fashion in view deletable_landing_objects created above:
+// Check threshold hour up to which compaction was done
+WITH compacted_hour_threshold AS (SELECT MAX(message_date || ' ' || lpad(message_hour+1, 2, '0') || ':00:00') threshold FROM streaming_mart)
+SELECT compacted_hour_threshold.threshold FROM compacted_hour_threshold
+
+// List all object that can be deleted from landing zone
+SELECT split(input_path, '/')[2] input_bucket,
+       split(input_path, '/')[length(input_path) - length(replace(input_path,'/'))] input_object,
+       substr(input_path, length(substring_index(input_path, '/', 3)) + 2) input_object_path
+FROM (SELECT distinct(input_file_name()) input_path FROM json_feed_view WHERE message_timestamp <  timestamp('2021-08-03 10:00:00')
+      EXCEPT
+      SELECT distinct(input_file_name()) input_path FROM json_feed_view WHERE message_timestamp >= timestamp('2021-08-03 10:00:00'))
+
+
+// ###################################################################
+// ################# Usage Statements ################################
+// ###################################################################
+
+// Check the list of message timestamps in the unioned streaming mart
+select * from (select distinct(message_timestamp) mt from streaming_mart_realtime) order by mt
+
+
+
+// ###################################################################
+// ################# Compaction Python Automation ####################
+// ###################################################################
+
+import sys
+sys.path.append('ibmcloudsql')
+import ibmcloudsql
+try:
+    from exceptions import RateLimitedException
+except Exception:
+    from .exceptions import RateLimitedException
+
+import test_credentials
+import pandas as pd
+sqlClient = ibmcloudsql.SQLQuery(test_credentials.apikey,
+		"crn:v1:bluemix:public:sql-query:us-south:a/d86af7367f70fba4f306d3c19c938f2f:983a7be6-923b-42f6-8212-45745f1939c3::",
+		"cos://us-south/sql-983a7be6-923b-42f6-8212-45745f1939c3/result/", client_info='ibmcloudsql test')
+sqlClient.logon()
+
+compactable=sqlClient.run_sql("select * from compactable_data")   
+
+if compactable.compactable_hours[0] > 0:
+	print("Compacting {} hours of data between {} and {}...".format(compactable.compactable_hours[0], compactable.compacted_hour_threshold[0], compactable.last_full_hour_threshold[0]))
+else:
+	print("Nothing to compact. Lastest compaction threshold is {}.".format(compactable.compacted_hour_threshold[0]))
+
+compactable['compacted_hour_threshold']=pd.to_datetime(compactable.compacted_hour_threshold)
+compactable['last_full_hour_threshold']=pd.to_datetime(compactable.last_full_hour_threshold)
+from dateutil import rrule
+from datetime import datetime, timedelta
+partition_adding_ddl = "ALTER TABLE streaming_mart ADD "
+for dt in rrule.rrule(rrule.HOURLY, dtstart=compactable.compacted_hour_threshold[0], until=(compactable.last_full_hour_threshold[0] - timedelta(hours=1))):
+	min_date_hour_string = dt.strftime("%Y-%m-%d %H:00:00")
+	max_date_hour_string = (dt + timedelta(hours=1)).strftime("%Y-%m-%d %H:00:00")
+	min_date_string = dt.strftime("%Y-%m-%d")
+	min_hour_string = dt.strftime("%H")
+	sqlClient.execute_sql(
+		"SELECT * FROM json_feed_view \
+		 WHERE message_timestamp >= timestamp('{min_date_hour_string}') AND message_timestamp < timestamp('{max_date_hour_string}') \
+		 INTO cos://us-south/my-data-lake-cos-bucket/landing_mart/message_date={min_date_string}/message_hour={min_hour_string} JOBPREFIX NONE STORED AS PARQUET \
+		 ".format(min_date_hour_string=min_date_hour_string, max_date_hour_string=max_date_hour_string,
+			   min_date_string=min_date_string, min_hour_string=min_hour_string))
+	print("ETL of data between {} and {} finished successfully.".format(min_date_hour_string, max_date_hour_string))
+	partition_adding_ddl += "PARTITION (message_date ='{min_date_string}', message_hour='{min_hour_string}') \
+				    LOCATION cos://us-south/my-data-lake-cos-bucket/landing_mart/message_date={min_date_string}/message_hour={min_hour_string} \
+				   ".format(min_date_string=min_date_string, min_hour_string=min_hour_string)
+
+if compactable.compactable_hours[0] > 0:
+	sqlClient.execute_sql(partition_adding_ddl)
+	print("Added {} new partitions to table streaming_mart.".format(compactable.compactable_hours[0]))
+
+new_threshold = compactable.last_full_hour_threshold[0].strftime("%Y-%m-%d %H:00:00")
+sqlClient.execute_sql(
+	"CREATE OR REPLACE VIEW streaming_mart_realtime AS \
+	 SELECT * FROM json_feed_view WHERE message_timestamp >= timestamp('{new_threshold}') \
+	 UNION ALL \
+	 SELECT device_id, message_timestamp, device_setup_time, payload_tz, row_number, longitude, latitude, pressure, temperature, humidity \
+	 FROM streaming_mart \
+	".format(new_threshold=new_threshold))
+
+print("Updated view streaming_mart_realtime with threshold between landing and mart zone at message_timestamp={}.".format(new_threshold))
+
+deletable_objects=sqlClient.run_sql("select * from deletable_landing_objects")
+if deletable_objects:
+	for deletable_object in deletable_objects.input_object_path:
+		df=sqlClient.delete_objects("cos://us-south/my-data-lake-cos-bucket/" + deletable_object, get_result=False)
+	print("Successfully deleted {} compacted objects from landing zone.".format(deletable_objects.shape[0]))
+else:
+	print("No objects to delete from landing zone.")
+
+
